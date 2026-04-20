@@ -1,0 +1,11 @@
+# name:path:mode
+# mode values:
+#   couchdb_main  = main Docker CouchDB stack with MariaDB dump and controlled downtime
+#   couchdb_stack = CouchDB stack that needs brief container downtime during archive creation
+#   direct        = direct folder backup with no container stop/start commands
+#
+# Replace these examples with the paths and modes that match the target server.
+docker-couchdb:/var/docker-couchdb:couchdb_main
+secondary-couchdb:/var/secondary-couchdb:couchdb_stack
+admin:/var/agents:direct
+app-data:/srv/app-data:direct
