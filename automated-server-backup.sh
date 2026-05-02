@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_FILE="${CONFIG_FILE:-/var/automated-server-backup/automated-server-backup.env}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${SCRIPT_DIR}/venv/bin/python3"
+
+CONFIG_FILE="${CONFIG_FILE:-/var/automated-server-backup/.env}"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -10,7 +13,11 @@ fi
 
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/automated-server-backup}"
 LOG_FILE="${LOG_FILE:-/var/log/automated-server-backup.log}"
+UPLOAD_PROVIDER="${UPLOAD_PROVIDER:-rclone}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+GDRIVE_SERVICE_ACCOUNT_JSON="${GDRIVE_SERVICE_ACCOUNT_JSON:-}"
+GDRIVE_SHARED_DRIVE_ID="${GDRIVE_SHARED_DRIVE_ID:-}"
+GDRIVE_PARENT_FOLDER_ID="${GDRIVE_PARENT_FOLDER_ID:-}"
 RETENTION_DAYS="${RETENTION_DAYS:-4}"
 DATE_STAMP="$(date +%Y%m%d)"
 RUN_BACKUP_DIR="${BACKUP_ROOT}/${DATE_STAMP}"
@@ -21,7 +28,7 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 ALERT_TITLE="${ALERT_TITLE:-Automated Server Backup Alert}"
 TMP_WORK_ROOT="${TMP_WORK_ROOT:-/var/tmp/automated-server-backup}"
-INCLUSION_LIST_FILE="${INCLUSION_LIST_FILE:-/var/automated-server-backup/automated-server-backup-inclusions.txt}"
+INCLUSION_LIST_FILE="${INCLUSION_LIST_FILE:-/var/automated-server-backup/directory-inclusions.txt}"
 STACK_DIRS=()
 
 mkdir -p "${BACKUP_ROOT}"
@@ -38,7 +45,7 @@ log() {
 }
 
 urlencode() {
-  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"
+  "${PYTHON}" -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"
 }
 
 send_alert() {
@@ -63,7 +70,7 @@ ${message}" >/dev/null || log "Telegram alert send failed"
         log "Google Chat alert not sent: ALERT_WEBHOOK_URL is missing"
         return 0
       fi
-      python3 - <<'PY' "${ALERT_WEBHOOK_URL}" "${ALERT_TITLE}" "${message}" || log "Google Chat alert send failed"
+      "${PYTHON}" - <<'PY' "${ALERT_WEBHOOK_URL}" "${ALERT_TITLE}" "${message}" || log "Google Chat alert send failed"
 import json, sys, urllib.request
 url, title, message = sys.argv[1], sys.argv[2], sys.argv[3]
 payload = json.dumps({"text": f"{title}\n{message}"}).encode()
@@ -76,7 +83,7 @@ PY
         log "Teams alert not sent: ALERT_WEBHOOK_URL is missing"
         return 0
       fi
-      python3 - <<'PY' "${ALERT_WEBHOOK_URL}" "${ALERT_TITLE}" "${message}" || log "Teams alert send failed"
+      "${PYTHON}" - <<'PY' "${ALERT_WEBHOOK_URL}" "${ALERT_TITLE}" "${message}" || log "Teams alert send failed"
 import json, sys, urllib.request
 url, title, message = sys.argv[1], sys.argv[2], sys.argv[3]
 payload = json.dumps({"text": f"{title}\n{message}"}).encode()
@@ -94,23 +101,66 @@ PY
 }
 
 validate_remote_access() {
-  if [[ -z "${RCLONE_REMOTE}" ]]; then
-    log "Skipping remote access validation: RCLONE_REMOTE is not configured"
-    return 0
-  fi
+  case "${UPLOAD_PROVIDER}" in
+    rclone)
+      if [[ -z "${RCLONE_REMOTE}" ]]; then
+        log "Skipping remote access validation: RCLONE_REMOTE is not configured"
+        return 0
+      fi
+      if ! command -v rclone >/dev/null 2>&1; then
+        log "Skipping remote access validation: rclone is not installed"
+        return 0
+      fi
+      log "Validating remote access for ${RCLONE_REMOTE}"
+      if ! rclone lsf "${RCLONE_REMOTE}" >/dev/null 2>&1; then
+        message="Backup stopped because Google Drive / rclone access validation failed for ${RCLONE_REMOTE}. OAuth or remote access may need to be reconnected."
+        log "${message}"
+        send_alert "${message}"
+        exit 1
+      fi
+      ;;
+    gdrive_service_account)
+      if [[ -z "${GDRIVE_SERVICE_ACCOUNT_JSON}" || -z "${GDRIVE_SHARED_DRIVE_ID}" || -z "${GDRIVE_PARENT_FOLDER_ID}" ]]; then
+        log "Skipping remote access validation: GDRIVE_SERVICE_ACCOUNT_JSON, GDRIVE_SHARED_DRIVE_ID, or GDRIVE_PARENT_FOLDER_ID is not configured"
+        return 0
+      fi
+      log "Validating Google Drive service account access"
+      if ! "${PYTHON}" - \
+          "${GDRIVE_SERVICE_ACCOUNT_JSON}" \
+          "${GDRIVE_SHARED_DRIVE_ID}" \
+          "${GDRIVE_PARENT_FOLDER_ID}" \
+          <<'PY' 2>/dev/null; then
+import sys
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-  if ! command -v rclone >/dev/null 2>&1; then
-    log "Skipping remote access validation: rclone is not installed"
-    return 0
-  fi
-
-  log "Validating remote access for ${RCLONE_REMOTE}"
-  if ! rclone lsf "${RCLONE_REMOTE}" >/dev/null 2>&1; then
-    message="Backup stopped because Google Drive / rclone access validation failed for ${RCLONE_REMOTE}. OAuth or remote access may need to be reconnected."
-    log "${message}"
-    send_alert "${message}"
-    exit 1
-  fi
+sa_file, drive_id, parent_id = sys.argv[1], sys.argv[2], sys.argv[3]
+creds = service_account.Credentials.from_service_account_file(
+    sa_file, scopes=['https://www.googleapis.com/auth/drive'])
+svc = build('drive', 'v3', credentials=creds)
+svc.files().list(
+    q=f"'{parent_id}' in parents",
+    driveId=drive_id,
+    includeItemsFromAllDrives=True,
+    supportsAllDrives=True,
+    corpora='drive',
+    fields='files(id)',
+    pageSize=1
+).execute()
+PY
+        message="Backup stopped because Google Drive service account access validation failed. Check GDRIVE_SERVICE_ACCOUNT_JSON and that the service account has access to the shared drive."
+        log "${message}"
+        send_alert "${message}"
+        exit 1
+      fi
+      ;;
+    none|"")
+      log "Skipping remote access validation: UPLOAD_PROVIDER is none"
+      ;;
+    *)
+      log "Unknown UPLOAD_PROVIDER '${UPLOAD_PROVIDER}'"
+      ;;
+  esac
 }
 
 cleanup() {
@@ -335,6 +385,103 @@ free_bytes_available() {
   df -PB1 "${BACKUP_ROOT}" | awk 'NR==2 {print $4}'
 }
 
+upload_and_prune_rclone() {
+  if [[ -z "${RCLONE_REMOTE}" ]]; then
+    log "Skipping upload: RCLONE_REMOTE is not configured in ${CONFIG_FILE}"
+    return 0
+  fi
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    log "Skipping upload: rclone is not installed"
+    return 0
+  fi
+
+  log "Uploading backup archives to ${RCLONE_REMOTE}"
+  rclone copy "${RUN_BACKUP_DIR}" "${RCLONE_REMOTE}${DATE_STAMP}/" --include '*.tar'
+
+  log "Pruning remote backups older than ${RETENTION_DAYS} days from ${RCLONE_REMOTE}"
+  rclone delete "${RCLONE_REMOTE}" --include '*.tar' --min-age "${RETENTION_DAYS}d"
+  rclone rmdirs "${RCLONE_REMOTE}" --leave-root || true
+
+  log "Removing local backup folder after successful upload: ${RUN_BACKUP_DIR}"
+  rm -rf "${RUN_BACKUP_DIR}"
+}
+
+upload_and_prune_gdrive_service_account() {
+  if [[ -z "${GDRIVE_SERVICE_ACCOUNT_JSON}" || -z "${GDRIVE_SHARED_DRIVE_ID}" || -z "${GDRIVE_PARENT_FOLDER_ID}" ]]; then
+    log "Skipping upload: GDRIVE_SERVICE_ACCOUNT_JSON, GDRIVE_SHARED_DRIVE_ID, or GDRIVE_PARENT_FOLDER_ID is not configured"
+    return 0
+  fi
+
+  log "Uploading backup archives to Google Shared Drive via service account"
+  "${PYTHON}" - \
+      "${GDRIVE_SERVICE_ACCOUNT_JSON}" \
+      "${GDRIVE_SHARED_DRIVE_ID}" \
+      "${GDRIVE_PARENT_FOLDER_ID}" \
+      "${RUN_BACKUP_DIR}" \
+      "${DATE_STAMP}" \
+      "${RETENTION_DAYS}" \
+      <<'PY'
+import sys, os
+from datetime import datetime, timezone, timedelta
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+sa_file, drive_id, parent_id, backup_dir, date_stamp, retention_days = \
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], int(sys.argv[6])
+
+creds = service_account.Credentials.from_service_account_file(
+    sa_file, scopes=['https://www.googleapis.com/auth/drive'])
+svc = build('drive', 'v3', credentials=creds)
+
+def get_or_create_folder(name, parent):
+    q = (f"name='{name}' and '{parent}' in parents "
+         f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    results = svc.files().list(
+        q=q, driveId=drive_id, includeItemsFromAllDrives=True,
+        supportsAllDrives=True, corpora='drive', fields='files(id)'
+    ).execute()
+    existing = results.get('files', [])
+    if existing:
+        return existing[0]['id']
+    folder = svc.files().create(
+        body={'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent]},
+        supportsAllDrives=True, fields='id'
+    ).execute()
+    return folder['id']
+
+folder_id = get_or_create_folder(date_stamp, parent_id)
+
+for fname in sorted(os.listdir(backup_dir)):
+    if not fname.endswith('.tar'):
+        continue
+    fpath = os.path.join(backup_dir, fname)
+    media = MediaFileUpload(fpath, mimetype='application/x-tar', resumable=True)
+    svc.files().create(
+        body={'name': fname, 'parents': [folder_id]},
+        media_body=media, supportsAllDrives=True, fields='id'
+    ).execute()
+    print(f"Uploaded: {fname}", flush=True)
+
+cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+results = svc.files().list(
+    q=(f"'{parent_id}' in parents "
+       f"and mimeType='application/vnd.google-apps.folder' and trashed=false"),
+    driveId=drive_id, includeItemsFromAllDrives=True, supportsAllDrives=True,
+    corpora='drive', fields='files(id,name,createdTime)'
+).execute()
+for f in results.get('files', []):
+    created = datetime.fromisoformat(f['createdTime'].replace('Z', '+00:00'))
+    if created < cutoff:
+        svc.files().delete(fileId=f['id'], supportsAllDrives=True).execute()
+        print(f"Deleted old backup folder: {f['name']}", flush=True)
+PY
+
+  log "Removing local backup folder after successful upload: ${RUN_BACKUP_DIR}"
+  rm -rf "${RUN_BACKUP_DIR}"
+}
+
 load_inclusion_list
 
 for entry in "${STACK_DIRS[@]}"; do
@@ -372,24 +519,21 @@ done
 log "Pruning local backups older than ${RETENTION_DAYS} days"
 find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex ".*/[0-9]{8}" -mtime +"$((RETENTION_DAYS - 1))" -exec rm -rf {} +
 
-if [[ -z "${RCLONE_REMOTE}" ]]; then
-  log "Skipping upload: RCLONE_REMOTE is not configured in ${CONFIG_FILE}"
-  exit 0
-fi
-
-if ! command -v rclone >/dev/null 2>&1; then
-  log "Skipping upload: rclone is not installed"
-  exit 0
-fi
-
-log "Uploading backup archives to ${RCLONE_REMOTE}"
-rclone copy "${RUN_BACKUP_DIR}" "${RCLONE_REMOTE}${DATE_STAMP}/" --include '*.tar'
-
-log "Pruning remote backups older than ${RETENTION_DAYS} days from ${RCLONE_REMOTE}"
-rclone delete "${RCLONE_REMOTE}" --include '*.tar' --min-age "${RETENTION_DAYS}d"
-rclone rmdirs "${RCLONE_REMOTE}" --leave-root || true
-
-log "Removing local backup folder after successful upload: ${RUN_BACKUP_DIR}"
-rm -rf "${RUN_BACKUP_DIR}"
+case "${UPLOAD_PROVIDER}" in
+  rclone)
+    upload_and_prune_rclone
+    ;;
+  gdrive_service_account)
+    upload_and_prune_gdrive_service_account
+    ;;
+  none|"")
+    log "Skipping upload: UPLOAD_PROVIDER is none"
+    ;;
+  *)
+    log "Unknown UPLOAD_PROVIDER '${UPLOAD_PROVIDER}'; skipping upload"
+    ;;
+esac
 
 log "Backup completed successfully"
+send_alert "Backup completed successfully on $(date '+%F %T').
+Archives uploaded: ${#STACK_DIRS[@]} .tar file(s)."
