@@ -1,6 +1,6 @@
 # automated-server-backup
 
-A Bash script for automated, scheduled server directory backups with optional cloud upload and alerting.
+A Python script for automated, scheduled server directory backups with optional cloud upload and alerting.
 
 **Author:** Jan Ivan Simoy (jimsimoy@gmail.com)
 **Powered by AI**
@@ -15,7 +15,7 @@ A Bash script for automated, scheduled server directory backups with optional cl
 - Estimates required disk space before running; aborts with alert if space is too low
 - Uploads archives to Google Drive via **rclone** or a **Google service account** (switchable)
 - Prunes old backups locally and remotely based on a configurable retention window
-- Sends failure alerts via Telegram, Google Chat, or Microsoft Teams
+- Sends alerts on backup success and failure via Telegram, Google Chat, or Microsoft Teams
 - Restarts any stopped containers automatically on unexpected exit
 
 ---
@@ -24,7 +24,7 @@ A Bash script for automated, scheduled server directory backups with optional cl
 
 ```
 automated-server-backup-to-gdrive/
-├── automated-server-backup.sh        # Main backup script
+├── automated-server-backup.py        # Main backup script (Python)
 ├── .env                              # Live config (gitignored — copy from .env.example)
 ├── .env.example                      # Config template
 ├── directory-inclusions.txt          # Live inclusion list (gitignored — copy from .sample)
@@ -51,8 +51,8 @@ cd /var/server_scripts/automated-server-backup-to-gdrive
 ### 2. Create the Python virtualenv and install dependencies
 
 ```bash
-apt install -y python3-venv
-python3 -m venv venv
+apt install -y python3.9 python3.9-venv python3.9-dev
+python3.9 -m venv venv
 venv/bin/pip install --upgrade pip
 venv/bin/pip install google-api-python-client google-auth
 ```
@@ -76,7 +76,7 @@ Edit `directory-inclusions.txt` to list the directories to back up (see format b
 ### 5. Set permissions
 
 ```bash
-chmod 750 automated-server-backup.sh
+chmod 750 automated-server-backup.py
 chmod 640 .env
 mkdir -p tmp
 ```
@@ -90,7 +90,7 @@ crontab -e
 Add a line such as:
 
 ```
-30 2 * * * /bin/bash /var/server_scripts/automated-server-backup-to-gdrive/automated-server-backup.sh >> /var/log/automated-server-backup.log 2>&1
+30 2 * * * /var/server_scripts/automated-server-backup-to-gdrive/venv/bin/python3 /var/server_scripts/automated-server-backup-to-gdrive/automated-server-backup.py >> /var/log/automated-server-backup.log 2>&1
 ```
 
 ---
@@ -269,14 +269,12 @@ ops:/var/ops:direct
 
 | Requirement | Purpose |
 |---|---|
-| `bash` 4+ | Script runtime |
+| `python3.9+` + `venv` | Script runtime and virtualenv |
 | `tar` | Archive creation |
 | `docker` | Container stop/start for CouchDB modes |
-| `python3` + `venv` | Virtualenv, URL encoding, webhook HTTP calls |
 | `google-api-python-client` | Google Drive service account upload (installed in `venv/`) |
 | `google-auth` | Service account authentication (installed in `venv/`) |
 | `rclone` | Cloud upload when `UPLOAD_PROVIDER=rclone` (optional) |
-| `curl` | Telegram alerts |
 
 ---
 
