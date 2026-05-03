@@ -366,8 +366,9 @@ def _latest_backup_size_or_dir_size(name: str, directory: str) -> int:
 
 
 def _estimate_required_bytes(stack_dirs: list) -> int:
-    total = sum(_latest_backup_size_or_dir_size(name, path) for name, path, _ in stack_dirs)
-    return total + (total * MARGIN_PERCENT // 100)
+    # Only need space for the largest single archive since each is uploaded and deleted before the next
+    largest = max(_latest_backup_size_or_dir_size(name, path) for name, path, _ in stack_dirs)
+    return largest + (largest * MARGIN_PERCENT // 100)
 
 
 def _free_bytes_available() -> int:
@@ -377,81 +378,103 @@ def _free_bytes_available() -> int:
     )
 
 # ---------------------------------------------------------------------------
-# Upload — rclone
+# Upload — rclone (per-tar)
 # ---------------------------------------------------------------------------
 
-def upload_and_prune_rclone():
+def _upload_tar_rclone(tar_path: Path):
     if not RCLONE_REMOTE:
         log.info("Skipping upload: RCLONE_REMOTE is not configured in %s", CONFIG_FILE)
         return
     if not shutil.which("rclone"):
         log.info("Skipping upload: rclone is not installed")
         return
-
-    log.info("Uploading backup archives to %s", RCLONE_REMOTE)
+    log.info("Uploading %s to %s", tar_path.name, RCLONE_REMOTE)
     subprocess.run(
-        ["rclone", "copy", str(RUN_BACKUP_DIR), f"{RCLONE_REMOTE}{DATE_STAMP}/", "--include", "*.tar"],
+        ["rclone", "copy", str(tar_path), f"{RCLONE_REMOTE}{DATE_STAMP}/"],
         check=True,
     )
+    tar_path.unlink()
+    log.info("Deleted local tar after upload: %s", tar_path.name)
+
+
+def _prune_remote_rclone():
+    if not RCLONE_REMOTE or not shutil.which("rclone"):
+        return
     log.info("Pruning remote backups older than %d days from %s", RETENTION_DAYS, RCLONE_REMOTE)
     subprocess.run(
         ["rclone", "delete", RCLONE_REMOTE, "--include", "*.tar", "--min-age", f"{RETENTION_DAYS}d"],
         check=True,
     )
     subprocess.run(["rclone", "rmdirs", RCLONE_REMOTE, "--leave-root"])
-    log.info("Removing local backup folder after successful upload: %s", RUN_BACKUP_DIR)
-    shutil.rmtree(RUN_BACKUP_DIR)
+
 
 # ---------------------------------------------------------------------------
-# Upload — Google Drive service account
+# Upload — Google Drive service account (per-tar)
 # ---------------------------------------------------------------------------
 
-def upload_and_prune_gdrive_service_account():
+_gdrive_svc = None
+_gdrive_run_folder_id = None
+
+
+def _get_gdrive_svc():
+    global _gdrive_svc
+    if _gdrive_svc is None:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        creds = service_account.Credentials.from_service_account_file(
+            GDRIVE_SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        _gdrive_svc = build("drive", "v3", credentials=creds)
+    return _gdrive_svc
+
+
+def _get_gdrive_run_folder() -> str:
+    global _gdrive_run_folder_id
+    if _gdrive_run_folder_id is None:
+        svc = _get_gdrive_svc()
+        results = svc.files().list(
+            q=(f"name='{DATE_STAMP}' and '{GDRIVE_PARENT_FOLDER_ID}' in parents "
+               f"and mimeType='application/vnd.google-apps.folder' and trashed=false"),
+            driveId=GDRIVE_SHARED_DRIVE_ID, includeItemsFromAllDrives=True,
+            supportsAllDrives=True, corpora="drive", fields="files(id)",
+        ).execute().get("files", [])
+        if results:
+            _gdrive_run_folder_id = results[0]["id"]
+        else:
+            _gdrive_run_folder_id = svc.files().create(
+                body={"name": DATE_STAMP,
+                      "mimeType": "application/vnd.google-apps.folder",
+                      "parents": [GDRIVE_PARENT_FOLDER_ID]},
+                supportsAllDrives=True, fields="id",
+            ).execute()["id"]
+    return _gdrive_run_folder_id
+
+
+def _upload_tar_gdrive(tar_path: Path):
     if not all([GDRIVE_SA_JSON, GDRIVE_SHARED_DRIVE_ID, GDRIVE_PARENT_FOLDER_ID]):
         log.info(
             "Skipping upload: GDRIVE_SERVICE_ACCOUNT_JSON, GDRIVE_SHARED_DRIVE_ID, "
             "or GDRIVE_PARENT_FOLDER_ID is not configured"
         )
         return
-
-    log.info("Uploading backup archives to Google Shared Drive via service account")
-
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
+    svc = _get_gdrive_svc()
+    folder_id = _get_gdrive_run_folder()
+    log.info("Uploading %s to Google Shared Drive", tar_path.name)
+    media = MediaFileUpload(str(tar_path), mimetype="application/x-tar", resumable=True)
+    svc.files().create(
+        body={"name": tar_path.name, "parents": [folder_id]},
+        media_body=media, supportsAllDrives=True, fields="id",
+    ).execute()
+    log.info("Uploaded: %s", tar_path.name)
+    tar_path.unlink()
+    log.info("Deleted local tar after upload: %s", tar_path.name)
 
-    creds = service_account.Credentials.from_service_account_file(
-        GDRIVE_SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    svc = build("drive", "v3", credentials=creds)
 
-    def _get_or_create_folder(name: str, parent: str) -> str:
-        results = svc.files().list(
-            q=(f"name='{name}' and '{parent}' in parents "
-               f"and mimeType='application/vnd.google-apps.folder' and trashed=false"),
-            driveId=GDRIVE_SHARED_DRIVE_ID, includeItemsFromAllDrives=True,
-            supportsAllDrives=True, corpora="drive", fields="files(id)",
-        ).execute()
-        existing = results.get("files", [])
-        if existing:
-            return existing[0]["id"]
-        return svc.files().create(
-            body={"name": name,
-                  "mimeType": "application/vnd.google-apps.folder",
-                  "parents": [parent]},
-            supportsAllDrives=True, fields="id",
-        ).execute()["id"]
-
-    folder_id = _get_or_create_folder(DATE_STAMP, GDRIVE_PARENT_FOLDER_ID)
-
-    for fpath in sorted(RUN_BACKUP_DIR.glob("*.tar")):
-        media = MediaFileUpload(str(fpath), mimetype="application/x-tar", resumable=True)
-        svc.files().create(
-            body={"name": fpath.name, "parents": [folder_id]},
-            media_body=media, supportsAllDrives=True, fields="id",
-        ).execute()
-        log.info("Uploaded: %s", fpath.name)
-
+def _prune_remote_gdrive():
+    if not all([GDRIVE_SA_JSON, GDRIVE_SHARED_DRIVE_ID, GDRIVE_PARENT_FOLDER_ID]):
+        return
+    svc = _get_gdrive_svc()
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
     old_folders = svc.files().list(
         q=(f"'{GDRIVE_PARENT_FOLDER_ID}' in parents "
@@ -459,15 +482,33 @@ def upload_and_prune_gdrive_service_account():
         driveId=GDRIVE_SHARED_DRIVE_ID, includeItemsFromAllDrives=True,
         supportsAllDrives=True, corpora="drive", fields="files(id,name,createdTime)",
     ).execute().get("files", [])
-
     for f in old_folders:
         created = datetime.fromisoformat(f["createdTime"].replace("Z", "+00:00"))
         if created < cutoff:
             svc.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
             log.info("Deleted old backup folder: %s", f["name"])
 
-    log.info("Removing local backup folder after successful upload: %s", RUN_BACKUP_DIR)
-    shutil.rmtree(RUN_BACKUP_DIR)
+
+# ---------------------------------------------------------------------------
+# Upload dispatcher
+# ---------------------------------------------------------------------------
+
+def upload_tar_to_remote(tar_path: Path):
+    if UPLOAD_PROVIDER == "rclone":
+        _upload_tar_rclone(tar_path)
+    elif UPLOAD_PROVIDER == "gdrive_service_account":
+        _upload_tar_gdrive(tar_path)
+    elif not UPLOAD_PROVIDER or UPLOAD_PROVIDER == "none":
+        log.info("Skipping upload: UPLOAD_PROVIDER is none")
+    else:
+        log.info("Unknown UPLOAD_PROVIDER '%s'; skipping upload", UPLOAD_PROVIDER)
+
+
+def prune_remote():
+    if UPLOAD_PROVIDER == "rclone":
+        _prune_remote_rclone()
+    elif UPLOAD_PROVIDER == "gdrive_service_account":
+        _prune_remote_gdrive()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -499,6 +540,7 @@ def main():
 
     for name, path, mode in stack_dirs:
         create_archive_for_stack(name, path, mode)
+        upload_tar_to_remote(RUN_BACKUP_DIR / f"{name}-{DATE_STAMP}.tar")
 
     log.info("Pruning local backups older than %d days", RETENTION_DAYS)
     cutoff_ts = datetime.now().timestamp() - (RETENTION_DAYS - 1) * 86400
@@ -507,14 +549,7 @@ def main():
             shutil.rmtree(d)
             log.info("Removed old local backup folder: %s", d.name)
 
-    if UPLOAD_PROVIDER == "rclone":
-        upload_and_prune_rclone()
-    elif UPLOAD_PROVIDER == "gdrive_service_account":
-        upload_and_prune_gdrive_service_account()
-    elif not UPLOAD_PROVIDER or UPLOAD_PROVIDER == "none":
-        log.info("Skipping upload: UPLOAD_PROVIDER is none")
-    else:
-        log.info("Unknown UPLOAD_PROVIDER '%s'; skipping upload", UPLOAD_PROVIDER)
+    prune_remote()
 
     log.info("Backup completed successfully")
     send_alert(
