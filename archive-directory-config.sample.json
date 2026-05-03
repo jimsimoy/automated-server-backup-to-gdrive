@@ -1,0 +1,20 @@
+{
+  "gdrive_service_account_json": "/path/to/secrets/your-service-account-key.json",
+  "gdrive_shared_drive_id": "YOUR_SHARED_DRIVE_ID",
+  "log_file": "/var/server_scripts/automated-server-backup-to-gdrive/tmp/archive-directory.log",
+  "tmp_dir": "/var/server_scripts/automated-server-backup-to-gdrive/tmp",
+  "directories": [
+    {
+      "name": "email_content_files",
+      "source_path": "/var/www/yourapp/storage/email_content_files",
+      "gdrive_folder_id": "YOUR_GDRIVE_FOLDER_ID",
+      "delete_after_upload": ["*"]
+    },
+    {
+      "name": "logs_only",
+      "source_path": "/var/www/yourapp/storage/other_files",
+      "gdrive_folder_id": "ANOTHER_GDRIVE_FOLDER_ID",
+      "delete_after_upload": ["*.log"]
+    }
+  ]
+}

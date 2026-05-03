@@ -1,5 +1,6 @@
 directory-inclusions.txt
 .env
+archive-directory-config.json
 automated-server-backup-replication-prompt.md
 __pycache__
 automated-server-backup.log
