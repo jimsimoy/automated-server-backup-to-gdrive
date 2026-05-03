@@ -485,8 +485,16 @@ def _prune_remote_gdrive():
     for f in old_folders:
         created = datetime.fromisoformat(f["createdTime"].replace("Z", "+00:00"))
         if created < cutoff:
-            svc.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
-            log.info("Deleted old backup folder: %s", f["name"])
+            try:
+                svc.files().update(
+                    fileId=f["id"], supportsAllDrives=True, body={"trashed": True}
+                ).execute()
+                log.info("Trashed old backup folder: %s", f["name"])
+            except Exception as e:
+                if getattr(e, "resp", None) and e.resp.status == 404:
+                    log.warning("Skipping already-gone folder: %s (%s)", f["name"], f["id"])
+                else:
+                    raise
 
 
 # ---------------------------------------------------------------------------
