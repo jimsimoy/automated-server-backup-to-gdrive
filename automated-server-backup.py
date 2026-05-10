@@ -560,9 +560,10 @@ def main():
     prune_remote()
 
     log.info("Backup completed successfully")
+    dirs_list = "\n".join(f"  • {path}" for _, path, _ in stack_dirs)
     send_alert(
         f"Backup completed successfully on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
-        f"Archives uploaded: {len(stack_dirs)} .tar file(s)."
+        f"Directories backed up ({len(stack_dirs)}):\n{dirs_list}"
     )
 
 
