@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,17 @@ TELEGRAM_CHAT_ID        = _cfg("TELEGRAM_CHAT_ID")
 ALERT_TITLE             = _cfg("ALERT_TITLE", "Automated Server Backup Alert")
 TMP_WORK_ROOT           = Path(_cfg("TMP_WORK_ROOT", "/var/tmp/automated-server-backup"))
 INCLUSION_LIST_FILE     = Path(_cfg("INCLUSION_LIST_FILE", "/var/automated-server-backup/directory-inclusions.txt"))
+MYSQL_BIN               = _cfg("MYSQL_BIN", "mysql")
+MYSQLDUMP_BIN           = _cfg("MYSQLDUMP_BIN", "mysqldump")
+MYSQL_HOST              = _cfg("MYSQL_HOST", "localhost")
+MYSQL_PORT              = _cfg("MYSQL_PORT", "3306")
+MYSQL_SOCKET            = _cfg("MYSQL_SOCKET")
+MYSQL_USER              = _cfg("MYSQL_USER", "root")
+MYSQL_PASSWORD          = _cfg("MYSQL_PASSWORD")
+MYSQL_DATABASES         = _cfg("MYSQL_DATABASES", "all")
+MYSQL_EXCLUDED_DATABASES = _cfg("MYSQL_EXCLUDED_DATABASES", "information_schema performance_schema sys")
+MYSQLDUMP_OPTIONS       = _cfg("MYSQLDUMP_OPTIONS", "--single-transaction --quick --routines --events --triggers")
+MYSQL_DUMP_ESTIMATE_BYTES = int(_cfg("MYSQL_DUMP_ESTIMATE_BYTES", "1073741824"))
 
 DATE_STAMP      = datetime.now().strftime("%Y%m%d")
 RUN_BACKUP_DIR  = BACKUP_ROOT / DATE_STAMP
@@ -269,6 +281,94 @@ def create_mariadb_dump():
         )
 
 # ---------------------------------------------------------------------------
+# MySQL dump
+# ---------------------------------------------------------------------------
+
+def _mysql_env() -> dict:
+    env = os.environ.copy()
+    if MYSQL_PASSWORD:
+        env["MYSQL_PWD"] = MYSQL_PASSWORD
+    return env
+
+
+def _mysql_connection_args() -> list:
+    args = []
+    if MYSQL_SOCKET:
+        args.extend(["--socket", MYSQL_SOCKET])
+    else:
+        args.extend(["--host", MYSQL_HOST, "--port", MYSQL_PORT])
+    if MYSQL_USER:
+        args.extend(["--user", MYSQL_USER])
+    return args
+
+
+def _configured_mysql_databases() -> list:
+    return [db for db in re.split(r"[\s,]+", MYSQL_DATABASES.strip()) if db]
+
+
+def _mysql_database_names() -> list:
+    configured = _configured_mysql_databases()
+    if configured and configured[0].lower() not in ("all", "*", "--all-databases"):
+        return configured
+
+    if not shutil.which(MYSQL_BIN):
+        raise FileNotFoundError(f"mysql executable not found: {MYSQL_BIN}")
+
+    result = subprocess.run(
+        [MYSQL_BIN, *_mysql_connection_args(), "--batch", "--skip-column-names", "--execute", "SHOW DATABASES"],
+        capture_output=True, text=True, check=True, env=_mysql_env(),
+    )
+    excluded = set(_configured_mysql_excluded_databases())
+    return [db for db in result.stdout.splitlines() if db and db not in excluded]
+
+
+def _configured_mysql_excluded_databases() -> list:
+    return [db for db in re.split(r"[\s,]+", MYSQL_EXCLUDED_DATABASES.strip()) if db]
+
+
+def _mysql_dump_command(database: str) -> list:
+    command = [MYSQLDUMP_BIN, *_mysql_connection_args()]
+    if MYSQLDUMP_OPTIONS:
+        command.extend(shlex.split(MYSQLDUMP_OPTIONS))
+    command.extend(["--databases", database])
+    return command
+
+
+def _safe_dump_filename(database: str, used_names: set) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", database).strip("._") or "database"
+    candidate = f"{base}-{DATE_STAMP}.sql"
+    counter = 2
+    while candidate in used_names:
+        candidate = f"{base}-{counter}-{DATE_STAMP}.sql"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def create_mysql_dump_archive(name: str):
+    if not shutil.which(MYSQLDUMP_BIN):
+        raise FileNotFoundError(f"mysqldump executable not found: {MYSQLDUMP_BIN}")
+
+    dump_dir = RUN_WORK_DIR / name
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = RUN_BACKUP_DIR / f"{name}-{DATE_STAMP}.tar"
+
+    databases = _mysql_database_names()
+    if not databases:
+        raise RuntimeError("No MySQL databases selected for dump")
+
+    used_names = set()
+    log.info("Creating individual MySQL logical dumps for %d database(s)", len(databases))
+    for database in databases:
+        dump_path = dump_dir / _safe_dump_filename(database, used_names)
+        log.info("Creating MySQL logical dump for database '%s': %s", database, dump_path)
+        with open(dump_path, "wb") as f:
+            subprocess.run(_mysql_dump_command(database), stdout=f, check=True, env=_mysql_env())
+
+    log.info("Creating MySQL dump archive: %s", archive_path)
+    _run_tar("-cf", str(archive_path), "-C", str(RUN_WORK_DIR), dump_dir.name)
+
+# ---------------------------------------------------------------------------
 # Tar archive creation
 # ---------------------------------------------------------------------------
 
@@ -317,6 +417,9 @@ def create_archive_for_stack(name: str, directory: str, mode: str):
         log.info("Creating backup archive for included path: %s", archive_path)
         _run_tar(*exclude, "-cf", str(archive_path), directory)
 
+    elif mode == "mysql_dump":
+        create_mysql_dump_archive(name)
+
     else:
         raise ValueError(f"Invalid backup mode '{mode}' for inclusion '{name}'")
 
@@ -339,7 +442,7 @@ def load_inclusion_list() -> list:
             log.info("Invalid inclusion list entry (expected name:path:mode): %s", line)
             sys.exit(1)
         name, path, mode = parts
-        if mode not in ("couchdb_main", "couchdb_stack", "direct"):
+        if mode not in ("couchdb_main", "couchdb_stack", "direct", "mysql_dump"):
             log.info("Invalid inclusion list mode '%s' in entry: %s", mode, line)
             sys.exit(1)
         if mode == "couchdb_main" and name != "docker-couchdb":
@@ -365,9 +468,18 @@ def _latest_backup_size_or_dir_size(name: str, directory: str) -> int:
                .stdout.split()[0])
 
 
+def _estimate_entry_size(name: str, directory: str, mode: str) -> int:
+    if mode == "mysql_dump":
+        tars = sorted(BACKUP_ROOT.glob(f"*/{name}-*.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if tars:
+            return tars[0].stat().st_size
+        return MYSQL_DUMP_ESTIMATE_BYTES
+    return _latest_backup_size_or_dir_size(name, directory)
+
+
 def _estimate_required_bytes(stack_dirs: list) -> int:
     # Only need space for the largest single archive since each is uploaded and deleted before the next
-    largest = max(_latest_backup_size_or_dir_size(name, path) for name, path, _ in stack_dirs)
+    largest = max(_estimate_entry_size(name, path, mode) for name, path, mode in stack_dirs)
     return largest + (largest * MARGIN_PERCENT // 100)
 
 
@@ -525,8 +637,8 @@ def prune_remote():
 def main():
     stack_dirs = load_inclusion_list()
 
-    for _, path, _ in stack_dirs:
-        if not Path(path).is_dir():
+    for _, path, mode in stack_dirs:
+        if mode != "mysql_dump" and not Path(path).is_dir():
             log.info("Missing required stack directory: %s", path)
             sys.exit(1)
 
@@ -560,10 +672,10 @@ def main():
     prune_remote()
 
     log.info("Backup completed successfully")
-    dirs_list = "\n".join(f"  • {path}" for _, path, _ in stack_dirs)
+    dirs_list = "\n".join(f"  • {name} ({mode})" for name, _, mode in stack_dirs)
     send_alert(
         f"Backup completed successfully on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
-        f"Directories backed up ({len(stack_dirs)}):\n{dirs_list}"
+        f"Backup entries completed ({len(stack_dirs)}):\n{dirs_list}"
     )
 
 
