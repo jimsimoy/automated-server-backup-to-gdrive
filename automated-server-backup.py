@@ -207,24 +207,34 @@ def validate_remote_access():
             )
             return
         log.info("Validating Google Drive service account access")
-        try:
-            from google.oauth2 import service_account
-            from googleapiclient.discovery import build
-            creds = service_account.Credentials.from_service_account_file(
-                GDRIVE_SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
-            )
-            build("drive", "v3", credentials=creds).files().list(
-                q=f"'{GDRIVE_PARENT_FOLDER_ID}' in parents",
-                driveId=GDRIVE_SHARED_DRIVE_ID,
-                includeItemsFromAllDrives=True, supportsAllDrives=True,
-                corpora="drive", fields="files(id)", pageSize=1,
-            ).execute()
-        except Exception as exc:
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                from google.oauth2 import service_account
+                from googleapiclient.discovery import build
+                import time as _time
+                creds = service_account.Credentials.from_service_account_file(
+                    GDRIVE_SA_JSON, scopes=["https://www.googleapis.com/auth/drive"]
+                )
+                build("drive", "v3", credentials=creds).files().list(
+                    q=f"'{GDRIVE_PARENT_FOLDER_ID}' in parents",
+                    driveId=GDRIVE_SHARED_DRIVE_ID,
+                    includeItemsFromAllDrives=True, supportsAllDrives=True,
+                    corpora="drive", fields="files(id)", pageSize=1,
+                ).execute()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 3:
+                    log.info("Google Drive validation attempt %d/3 failed (%s); retrying in 30s", attempt, exc)
+                    _time.sleep(30)
+        if last_exc is not None:
             msg = (
-                "Backup stopped because Google Drive service account access validation failed. "
-                "Check GDRIVE_SERVICE_ACCOUNT_JSON and that the service account has access to the shared drive."
+                f"Backup stopped because Google Drive access validation failed after 3 attempts. "
+                f"Error: {last_exc}"
             )
-            log.info("%s Error: %s", msg, exc)
+            log.info(msg)
             send_alert(msg)
             sys.exit(1)
 
