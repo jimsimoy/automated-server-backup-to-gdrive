@@ -645,6 +645,7 @@ def prune_remote():
 # ---------------------------------------------------------------------------
 
 def main():
+    _start = datetime.now()
     stack_dirs = load_inclusion_list()
 
     for _, path, mode in stack_dirs:
@@ -682,10 +683,15 @@ def main():
     prune_remote()
 
     log.info("Backup completed successfully")
+    elapsed = datetime.now() - _start
+    h, rem = divmod(int(elapsed.total_seconds()), 3600)
+    m, s   = divmod(rem, 60)
+    elapsed_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
     dirs_list = "\n".join(f"  • {name} ({mode})" for name, _, mode in stack_dirs)
     send_alert(
         f"Backup completed successfully on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
-        f"Backup entries completed ({len(stack_dirs)}):\n{dirs_list}"
+        f"Backup entries completed ({len(stack_dirs)}):\n{dirs_list}\n"
+        f"\nTime elapsed: {elapsed_str}"
     )
 
 
