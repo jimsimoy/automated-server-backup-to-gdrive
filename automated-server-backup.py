@@ -579,15 +579,49 @@ def _upload_tar_gdrive(tar_path: Path):
             "or GDRIVE_PARENT_FOLDER_ID is not configured"
         )
         return
+    import socket
+    import ssl
+    import time
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
+
+    CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB — smaller chunks reduce re-work on retry
+    MAX_ATTEMPTS = 8
+    NUM_RETRIES = 5  # retries inside each execute() call for transient HTTP errors
+
     svc = _get_gdrive_svc()
     folder_id = _get_gdrive_run_folder()
     log.info("Uploading %s to Google Shared Drive", tar_path.name)
-    media = MediaFileUpload(str(tar_path), mimetype="application/x-tar", resumable=True)
-    svc.files().create(
+    media = MediaFileUpload(
+        str(tar_path), mimetype="application/x-tar",
+        resumable=True, chunksize=CHUNK_SIZE,
+    )
+    request = svc.files().create(
         body={"name": tar_path.name, "parents": [folder_id]},
         media_body=media, supportsAllDrives=True, fields="id",
-    ).execute()
+    )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            request.execute(num_retries=NUM_RETRIES)
+            break
+        except (ssl.SSLError, socket.error, OSError) as exc:
+            if attempt >= MAX_ATTEMPTS:
+                raise
+            wait = min(2 ** attempt, 120)
+            log.warning(
+                "Upload connection error (attempt %d/%d): %s — retrying in %ds",
+                attempt, MAX_ATTEMPTS, exc, wait,
+            )
+            time.sleep(wait)
+        except HttpError as exc:
+            if attempt >= MAX_ATTEMPTS or exc.resp.status not in (429, 500, 502, 503, 504):
+                raise
+            wait = min(2 ** attempt, 120)
+            log.warning(
+                "Upload HTTP %s (attempt %d/%d) — retrying in %ds",
+                exc.resp.status, attempt, MAX_ATTEMPTS, wait,
+            )
+            time.sleep(wait)
     log.info("Uploaded: %s", tar_path.name)
     tar_path.unlink()
     log.info("Deleted local tar after upload: %s", tar_path.name)
@@ -679,6 +713,15 @@ def main():
         if d.is_dir() and re.fullmatch(r"\d{8}", d.name) and d.stat().st_mtime < cutoff_ts:
             shutil.rmtree(d)
             log.info("Removed old local backup folder: %s", d.name)
+
+    log.info("Pruning tmp work folders, keeping only the latest")
+    tmp_dated = sorted(
+        [d for d in TMP_WORK_ROOT.iterdir() if d.is_dir() and re.fullmatch(r"\d{8}", d.name)],
+        key=lambda d: d.name,
+    )
+    for d in tmp_dated[:-1]:
+        shutil.rmtree(d)
+        log.info("Removed old tmp folder: %s", d.name)
 
     prune_remote()
 
