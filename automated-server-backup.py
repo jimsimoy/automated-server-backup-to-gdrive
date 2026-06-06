@@ -582,6 +582,7 @@ def _upload_tar_gdrive(tar_path: Path):
     import socket
     import time as _time
     from googleapiclient.http import MediaFileUpload
+
     svc = _get_gdrive_svc()
     folder_id = _get_gdrive_run_folder()
     log.info("Uploading %s to Google Shared Drive", tar_path.name)
@@ -708,6 +709,15 @@ def main():
         if d.is_dir() and re.fullmatch(r"\d{8}", d.name) and d.stat().st_mtime < cutoff_ts:
             shutil.rmtree(d)
             log.info("Removed old local backup folder: %s", d.name)
+
+    log.info("Pruning tmp work folders, keeping only the latest")
+    tmp_dated = sorted(
+        [d for d in TMP_WORK_ROOT.iterdir() if d.is_dir() and re.fullmatch(r"\d{8}", d.name)],
+        key=lambda d: d.name,
+    )
+    for d in tmp_dated[:-1]:
+        shutil.rmtree(d)
+        log.info("Removed old tmp folder: %s", d.name)
 
     prune_remote()
 
