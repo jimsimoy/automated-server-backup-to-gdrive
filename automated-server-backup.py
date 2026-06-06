@@ -47,7 +47,7 @@ _env = _load_env(CONFIG_FILE)
 
 
 def _cfg(key: str, default: str = "") -> str:
-    return _env.get(key, os.environ.get(key, default))
+    return os.environ.get(key, _env.get(key, default))
 
 
 BACKUP_ROOT             = Path(_cfg("BACKUP_ROOT", "/var/backups/automated-server-backup"))
@@ -579,15 +579,44 @@ def _upload_tar_gdrive(tar_path: Path):
             "or GDRIVE_PARENT_FOLDER_ID is not configured"
         )
         return
+    import socket
+    import time as _time
     from googleapiclient.http import MediaFileUpload
     svc = _get_gdrive_svc()
     folder_id = _get_gdrive_run_folder()
     log.info("Uploading %s to Google Shared Drive", tar_path.name)
-    media = MediaFileUpload(str(tar_path), mimetype="application/x-tar", resumable=True)
-    svc.files().create(
+    media = MediaFileUpload(
+        str(tar_path), mimetype="application/x-tar",
+        resumable=True, chunksize=50 * 1024 * 1024,
+    )
+    request = svc.files().create(
         body={"name": tar_path.name, "parents": [folder_id]},
         media_body=media, supportsAllDrives=True, fields="id",
-    ).execute()
+    )
+    response = None
+    retries = 0
+    prev_pct = -1
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(300)
+    try:
+        while response is None:
+            try:
+                status, response = request.next_chunk()
+                retries = 0
+                if status:
+                    pct = int(status.progress() * 100)
+                    if pct != prev_pct:
+                        log.info("Uploading %s: %d%%", tar_path.name, pct)
+                        prev_pct = pct
+            except Exception as exc:
+                retries += 1
+                if retries > 10:
+                    raise RuntimeError(f"Upload of {tar_path.name} failed after 10 retries") from exc
+                wait = min(30 * retries, 300)
+                log.info("Upload chunk error (retry %d/10 in %ds): %s", retries, wait, exc)
+                _time.sleep(wait)
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     log.info("Uploaded: %s", tar_path.name)
     tar_path.unlink()
     log.info("Deleted local tar after upload: %s", tar_path.name)
